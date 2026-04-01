@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, time
 from typing import Any, Iterable
 
 import pandas as pd
 import yfinance as yf
+from zoneinfo import ZoneInfo
 
 
 def default_nse_universe() -> list[str]:
@@ -74,6 +76,24 @@ class ScanConfig:
     min_rows: int = 30
 
 
+def _in_intraday_scan_window() -> bool:
+    now_ist = datetime.now(ZoneInfo("Asia/Kolkata")).time()
+    return time(9, 15) <= now_ist <= time(11, 30)
+
+
+def _market_is_bearish(interval: str, period: str) -> bool:
+    idx = _fetch_intraday(symbol="^NSEI", interval=interval, period=period)
+    if idx.empty:
+        return False
+    close_like = idx["close"] if "close" in idx.columns else pd.Series(dtype=float)
+    if isinstance(close_like, pd.DataFrame):
+        close_like = close_like.iloc[:, 0]
+    close = pd.to_numeric(close_like, errors="coerce").dropna()
+    if len(close) < 3:
+        return False
+    return bool(close.iloc[-1] < close.iloc[0])
+
+
 def _safe_last(series_like: Any) -> float | None:
     """
     Return the last numeric value from a 1D-like input.
@@ -130,6 +150,8 @@ def scan_universe(
     - momentum (last close vs first close of day)
     """
     cfg = ScanConfig(interval=interval, min_price=min_price)
+    time_window_ok = _in_intraday_scan_window()
+    market_bearish = _market_is_bearish(interval=cfg.interval, period=cfg.period)
     rows: list[dict] = []
     for symbol in universe:
         df = _fetch_intraday(symbol=symbol, interval=cfg.interval, period=cfg.period)
@@ -165,9 +187,18 @@ def scan_universe(
             continue
         if abs(momentum_pct) <= 0.3:
             continue
+        volume_confirmed = vol_spike >= 1.05
+        if not volume_confirmed:
+            continue
 
         score = (abs(momentum_pct) * 0.7) + (min(vol_spike, 10.0) * 3.0)
         direction_hint = "UP" if momentum_pct >= 0 else "DOWN"
+        trade_bias = "LONG" if direction_hint == "UP" else "SHORT"
+
+        if market_bearish and trade_bias == "LONG":
+            continue
+        if not time_window_ok:
+            continue
 
         rows.append(
             {
@@ -176,6 +207,10 @@ def scan_universe(
                 "momentum_%": round(momentum_pct, 2),
                 "vol_spike_x": round(vol_spike, 2),
                 "direction": direction_hint,
+                "trade_bias": trade_bias,
+                "market_bias": "BEARISH" if market_bearish else "BULLISH_OR_NEUTRAL",
+                "time_window_ok": time_window_ok,
+                "volume_confirmed": volume_confirmed,
                 "scan_score": round(score, 2),
             }
         )
