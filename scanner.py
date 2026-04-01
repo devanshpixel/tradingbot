@@ -158,6 +158,8 @@ def scan_universe(
     symbols = list(universe)
     if not symbols:
         symbols = default_nse_universe()
+    # Performance guard: keep scan fast for UI.
+    symbols = symbols[:20]
 
     rows: list[dict] = []
     for symbol in symbols:
