@@ -34,14 +34,44 @@ def _fetch(symbol: str, interval: str) -> pd.DataFrame:
     return df
 
 
-def _market_is_bearish(interval: str) -> bool:
+def get_nifty_trend(interval: str) -> str:
+    """
+    Determine the intraday NIFTY 50 trend using EMA crossover.
+
+    Logic
+    -----
+    - EMA9 and EMA20 are computed on the day's 5-min (or selected interval) bars.
+    - UP   : price > EMA9 > EMA20  (clear uptrend structure)
+    - DOWN : price < EMA9 < EMA20  (clear downtrend structure)
+    - NEUTRAL : mixed / insufficient data
+
+    Returns 'UP', 'DOWN', or 'NEUTRAL'.
+    """
     idx = _fetch(symbol="^NSEI", interval=interval)
     if idx.empty:
-        return False
+        return "NEUTRAL"
     close = pd.to_numeric(_to_1d_series(idx, "close"), errors="coerce").dropna()
-    if len(close) < 3:
-        return False
-    return bool(close.iloc[-1] < close.iloc[0])
+    if len(close) < 20:
+        return "NEUTRAL"
+
+    ema9  = close.ewm(span=9,  adjust=False).mean()
+    ema20 = close.ewm(span=20, adjust=False).mean()
+
+    last_close = float(close.iloc[-1])
+    last_ema9  = float(ema9.iloc[-1])
+    last_ema20 = float(ema20.iloc[-1])
+
+    if last_close > last_ema9 and last_ema9 > last_ema20:
+        return "UP"
+    if last_close < last_ema9 and last_ema9 < last_ema20:
+        return "DOWN"
+
+    # Borderline: use price vs EMA20 with a small dead-band (±0.15%)
+    if last_close > last_ema20 * 1.0015:
+        return "UP"
+    if last_close < last_ema20 * 0.9985:
+        return "DOWN"
+    return "NEUTRAL"
 
 
 def _in_intraday_signal_window() -> bool:
@@ -373,15 +403,20 @@ def _rr(entry: float, stop: float, target: float, side: str) -> float:
     return round(reward / risk, 2)
 
 
-def generate_signal_row(symbol: str, interval: str, sentiment: SentimentResult) -> dict[str, Any]:
+def generate_signal_row(
+    symbol: str,
+    interval: str,
+    sentiment: SentimentResult,
+    nifty_trend: str = "NEUTRAL",
+) -> dict[str, Any]:
     time_window_ok = _in_intraday_signal_window()
-    market_bearish = _market_is_bearish(interval=interval)
+    market_bearish = (nifty_trend == "DOWN")  # kept for label compatibility
     try:
         df = _fetch(symbol=symbol, interval=interval)
         if df.empty or len(df) < 20:
             row = _hold_row(symbol, sentiment)
             row["time_window_ok"] = time_window_ok
-            row["market_bias"] = "BEARISH" if market_bearish else "BULLISH_OR_NEUTRAL"
+            row["market_bias"] = nifty_trend
             return row
 
         close = pd.to_numeric(_to_1d_series(df, "close"), errors="coerce")
@@ -396,7 +431,7 @@ def generate_signal_row(symbol: str, interval: str, sentiment: SentimentResult) 
         if close_clean.empty or high_clean.empty or low_clean.empty:
             row = _hold_row(symbol, sentiment)
             row["time_window_ok"] = time_window_ok
-            row["market_bias"] = "BEARISH" if market_bearish else "BULLISH_OR_NEUTRAL"
+            row["market_bias"] = nifty_trend
             return row
 
         last_close = float(close_clean.iloc[-1])
@@ -439,7 +474,7 @@ def generate_signal_row(symbol: str, interval: str, sentiment: SentimentResult) 
             row = _hold_row(symbol, sentiment)
             row.update({
                 "time_window_ok": time_window_ok,
-                "market_bias": "BEARISH" if market_bearish else "BULLISH_OR_NEUTRAL",
+                "market_bias": nifty_trend,
                 "adx": round(float(adx), 1),
                 "rsi": round(float(rsi), 1),
                 "regime": "SIDEWAYS",
@@ -542,10 +577,6 @@ def generate_signal_row(symbol: str, interval: str, sentiment: SentimentResult) 
         elif sent_boost < 0:
             sell_pts += min(8.0, abs(sent_boost) * 0.15)
 
-        # Market bias penalty
-        if market_bearish:
-            buy_pts *= 0.75
-
         # Determine direction
         _SIGNAL_THRESHOLD = 20.0
         if buy_pts >= _SIGNAL_THRESHOLD and buy_pts > sell_pts:
@@ -555,6 +586,28 @@ def generate_signal_row(symbol: str, interval: str, sentiment: SentimentResult) 
         else:
             side = "FLAT"
         signal = "BUY" if side == "LONG" else ("SELL" if side == "SHORT" else "HOLD")
+
+        # --- Hard NIFTY market filter ---
+        # Trade only in the direction the index is trending.
+        # NEUTRAL allows both directions (no restriction).
+        if nifty_trend == "UP" and signal == "SELL":
+            row = _hold_row(symbol, sentiment)
+            row.update({
+                "time_window_ok": time_window_ok,
+                "market_bias": nifty_trend,
+                "rsi": round(float(rsi), 1),
+                "score_total": round(float(buy_pts + sell_pts), 2),
+            })
+            return row
+        if nifty_trend == "DOWN" and signal == "BUY":
+            row = _hold_row(symbol, sentiment)
+            row.update({
+                "time_window_ok": time_window_ok,
+                "market_bias": nifty_trend,
+                "rsi": round(float(rsi), 1),
+                "score_total": round(float(buy_pts + sell_pts), 2),
+            })
+            return row
 
         # Confidence: scale the winning side's score to 0–100
         _MAX_PTS = 85.0
@@ -574,8 +627,6 @@ def generate_signal_row(symbol: str, interval: str, sentiment: SentimentResult) 
 
         # Time window and volume adjustments
         volume_confirmed = volume_spike_ok
-        if side == "LONG" and market_bearish:
-            confidence *= 0.85
         if side in {"LONG", "SHORT"} and not time_window_ok:
             confidence *= 0.90
 
@@ -600,7 +651,7 @@ def generate_signal_row(symbol: str, interval: str, sentiment: SentimentResult) 
                 row = _hold_row(symbol, sentiment)
                 row.update({
                     "time_window_ok": time_window_ok,
-                    "market_bias": "BEARISH" if market_bearish else "BULLISH_OR_NEUTRAL",
+                    "market_bias": nifty_trend,
                     "adx": round(float(adx), 1),
                     "rsi": round(float(rsi), 1),
                     "regime": regime,
@@ -647,7 +698,7 @@ def generate_signal_row(symbol: str, interval: str, sentiment: SentimentResult) 
             "candlestick": pattern_name,
             "support": round(float(support), 2) if support is not None else round(float(last_close), 2),
             "resistance": round(float(resistance), 2) if resistance is not None else round(float(last_close), 2),
-            "market_bias": "BEARISH" if market_bearish else "BULLISH_OR_NEUTRAL",
+            "market_bias": nifty_trend,
             "time_window_ok": time_window_ok,
             "adx": round(float(adx), 1),
             "regime": regime,
@@ -666,6 +717,6 @@ def generate_signal_row(symbol: str, interval: str, sentiment: SentimentResult) 
     except Exception:
         row = _hold_row(symbol, sentiment)
         row["time_window_ok"] = time_window_ok
-        row["market_bias"] = "BEARISH" if market_bearish else "BULLISH_OR_NEUTRAL"
+        row["market_bias"] = nifty_trend
         return row
 

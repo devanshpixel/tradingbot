@@ -7,7 +7,7 @@ import streamlit.components.v1 as components
 
 from news import fetch_google_news_rss, fetch_finnhub_news, sentiment_from_articles
 from scanner import default_nse_universe, scan_universe
-from signals import generate_signal_row
+from signals import generate_signal_row, get_nifty_trend
 from tracker import TradeTracker
 
 
@@ -71,6 +71,19 @@ if refresh_now:
 
 tracker = TradeTracker(db_path="paper_trades.db")
 
+# Fetch NIFTY trend once — reused by every signal call to avoid N redundant fetches
+nifty_trend = get_nifty_trend(interval=interval)
+_TREND_COLOR = {"UP": "🟢", "DOWN": "🔴", "NEUTRAL": "🟡"}
+_TREND_LABEL = {
+    "UP":      "NIFTY UP — only BUY signals active",
+    "DOWN":    "NIFTY DOWN — only SELL signals active",
+    "NEUTRAL": "NIFTY NEUTRAL — both directions active",
+}
+with st.sidebar:
+    st.markdown("---")
+    st.markdown(f"**Market filter:** {_TREND_COLOR.get(nifty_trend, '🟡')} `{nifty_trend}`")
+    st.caption(_TREND_LABEL.get(nifty_trend, ""))
+
 universe = default_nse_universe()[:max_symbols]
 scan_df = scan_universe(universe=universe, interval=interval, min_price=min_price)
 
@@ -94,6 +107,7 @@ for _, s in scan_df.head(20).iterrows():
         symbol=symbol,
         interval=interval,
         sentiment=sentiment,
+        nifty_trend=nifty_trend,
     )
     rows.append(row)
 
