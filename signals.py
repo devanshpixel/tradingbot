@@ -171,36 +171,69 @@ def _entry_timing(
     close: pd.Series,
     high: pd.Series,
     low: pd.Series,
+    open_: pd.Series,
+    vol: pd.Series,
     atr: float,
     direction: str,
     lookback: int = 12,
 ) -> tuple[str, float, float]:
     """
-    Classify the current bar's entry quality.
+    Classify the current bar's entry quality with fake-breakout filters.
+
+    Three hard rejection rules applied before any quality scoring:
+      1. Body confirmation  — the breakout bar must CLOSE above/below the pivot
+                              with a real body (not a wick spike that reversed).
+      2. Volume gate        — the breakout bar's volume must be >= 1.3x the avg
+                              volume of the reference window; low-vol breakouts
+                              are structurally weak and frequently reverse.
+      3. Reversal rejection — if the bar *after* the breakout closes back toward
+                              the pivot (bearish follow-through for a long
+                              breakout, bullish for a short), the setup is
+                              already failing; do not enter.
 
     Returns
     -------
     timing : str
-        "PULLBACK" | "BREAKOUT" | "CHASING" | "EXTENDED" | "NO_BREAKOUT"
+        "PULLBACK" | "BREAKOUT" | "CHASING" | "EXTENDED"
+        | "FAKE_BREAKOUT" | "REVERSAL" | "NO_BREAKOUT"
     entry_offset : float
-        Fraction to add/subtract from last_close to get the ideal entry price.
-        Positive = higher (for longs entering at breakout level + buffer).
+        Fraction to add/subtract from last_close for the ideal entry price.
     confidence_mult : float
         Multiply the raw confidence score by this factor.
     """
-    c = pd.to_numeric(close, errors="coerce").dropna()
-    h = pd.to_numeric(high, errors="coerce").dropna()
-    l = pd.to_numeric(low, errors="coerce").dropna()
+    c  = pd.to_numeric(close, errors="coerce").dropna()
+    h  = pd.to_numeric(high,  errors="coerce").dropna()
+    l  = pd.to_numeric(low,   errors="coerce").dropna()
+    o  = pd.to_numeric(open_, errors="coerce").dropna()
+    v  = pd.to_numeric(vol,   errors="coerce").fillna(0.0)
 
     min_len = lookback + 4
     if len(c) < min_len or atr <= 0:
         return "NO_BREAKOUT", 0.0, 0.80
 
-    last_close = float(c.iloc[-1])
-    # Reference window: bars before the most recent 2 bars (avoid including the signal bar)
-    ref_high = float(h.iloc[-(lookback + 2): -2].max())
-    ref_low  = float(l.iloc[-(lookback + 2): -2].min())
+    # Align all series to the same length
+    n = min(len(c), len(h), len(l), len(o), len(v))
+    c, h, l, o, v = c.iloc[-n:], h.iloc[-n:], l.iloc[-n:], o.iloc[-n:], v.iloc[-n:]
 
+    last_close = float(c.iloc[-1])
+    last_open  = float(o.iloc[-1])
+    last_vol   = float(v.iloc[-1])
+    prev_close = float(c.iloc[-2])
+    prev_open  = float(o.iloc[-2])
+    prev_vol   = float(v.iloc[-2])
+
+    # Reference window: bars before the most recent 2 (exclude signal + confirmation bar)
+    ref_h   = h.iloc[-(lookback + 2): -2]
+    ref_l   = l.iloc[-(lookback + 2): -2]
+    ref_v   = v.iloc[-(lookback + 2): -2]
+    ref_high = float(ref_h.max())
+    ref_low  = float(ref_l.min())
+    vol_avg  = float(ref_v.mean()) if not ref_v.empty else 0.0
+
+    # Volume threshold for a real breakout bar
+    _VOL_MULT = 1.3
+
+    # ------------------------------------------------------------------ LONG
     if direction == "LONG":
         pivot = ref_high
         if last_close <= pivot:
@@ -208,34 +241,103 @@ def _entry_timing(
 
         extension = (last_close - pivot) / atr
 
-        # Detect pullback: price broke out then retraced back near the pivot
+        # Identify which bar is the "breakout bar":
+        #   - Fresh: current bar (bar[-1]) just crossed above pivot
+        #   - Confirmed: bar[-2] broke above, bar[-1] is follow-through
+        fresh_breakout = prev_close <= pivot < last_close  # crossed on this bar
+        # The bar that actually broke out
+        bo_close = last_close if fresh_breakout else prev_close
+        bo_open  = last_open  if fresh_breakout else prev_open
+        bo_vol   = last_vol   if fresh_breakout else prev_vol
+
+        # --- Rule 1: body close-above confirmation ---
+        # The breakout bar's body (not just wick) must close above the pivot.
+        # Allow a very small wick tolerance: body_close > pivot - 0.05*atr
+        body_confirmed = bo_close > (pivot - 0.05 * atr) and bo_close >= bo_open
+
+        # Wick spike: high was above pivot but bar closed back below or barely above
+        wick_spike = (
+            float(h.iloc[-1]) > pivot
+            and last_close < pivot + 0.15 * atr
+            and last_close < last_open  # bearish close
+        )
+
+        if wick_spike or not body_confirmed:
+            return "FAKE_BREAKOUT", 0.0, 0.0
+
+        # --- Rule 2: volume gate on the breakout bar ---
+        if vol_avg > 0 and bo_vol < vol_avg * _VOL_MULT:
+            return "FAKE_BREAKOUT", 0.0, 0.0
+
+        # --- Rule 3: reversal on the bar after the breakout ---
+        # Only applies when the breakout was on bar[-2] and bar[-1] is the confirmation bar
+        if not fresh_breakout:
+            reversal = (
+                last_close < prev_close * 0.998   # current bar losing ground
+                and last_close < pivot + 0.3 * atr  # retreating toward pivot
+                and last_close < last_open           # bearish body on confirm bar
+            )
+            if reversal:
+                return "REVERSAL", 0.0, 0.0
+
+        # --- Quality scoring ---
         recent_high = float(h.iloc[-4: -1].max()) if len(h) >= 4 else last_close
-        pulled_back = recent_high > last_close * 1.003  # price was higher, now pulled back
-        near_pivot  = extension < 0.6                  # still close to breakout level
+        pulled_back = recent_high > last_close * 1.003
+        near_pivot  = extension < 0.6
 
         if pulled_back and near_pivot:
-            # Best scenario: entering on a pullback to the breakout level
-            # Entry = just above the pivot
             entry_price = pivot * 1.001
             offset = (entry_price - last_close) / last_close
             return "PULLBACK", offset, 1.20
 
         if extension <= 1.0:
-            return "BREAKOUT", 0.0, 1.05      # fresh breakout — decent entry
+            return "BREAKOUT", 0.0, 1.05
         if extension <= 2.0:
-            return "CHASING", 0.0, 0.70       # move already underway, risky
-        return "EXTENDED", 0.0, 0.30          # far too late, strong penalty
+            return "CHASING", 0.0, 0.70
+        return "EXTENDED", 0.0, 0.30
 
-    else:  # SHORT
+    # ----------------------------------------------------------------- SHORT
+    else:
         pivot = ref_low
         if last_close >= pivot:
             return "NO_BREAKOUT", 0.0, 0.65
 
         extension = (pivot - last_close) / atr
 
-        recent_low = float(l.iloc[-4: -1].min()) if len(l) >= 4 else last_close
-        bounced_up = recent_low < last_close * 0.997
-        near_pivot = extension < 0.6
+        fresh_breakout = prev_close >= pivot > last_close
+        bo_close = last_close if fresh_breakout else prev_close
+        bo_open  = last_open  if fresh_breakout else prev_open
+        bo_vol   = last_vol   if fresh_breakout else prev_vol
+
+        # --- Rule 1: body confirmation (bearish bar breaking below pivot) ---
+        body_confirmed = bo_close < (pivot + 0.05 * atr) and bo_close <= bo_open
+
+        wick_spike = (
+            float(l.iloc[-1]) < pivot
+            and last_close > pivot - 0.15 * atr
+            and last_close > last_open
+        )
+
+        if wick_spike or not body_confirmed:
+            return "FAKE_BREAKOUT", 0.0, 0.0
+
+        # --- Rule 2: volume gate ---
+        if vol_avg > 0 and bo_vol < vol_avg * _VOL_MULT:
+            return "FAKE_BREAKOUT", 0.0, 0.0
+
+        # --- Rule 3: reversal detection ---
+        if not fresh_breakout:
+            reversal = (
+                last_close > prev_close * 1.002
+                and last_close > pivot - 0.3 * atr
+                and last_close > last_open
+            )
+            if reversal:
+                return "REVERSAL", 0.0, 0.0
+
+        recent_low  = float(l.iloc[-4: -1].min()) if len(l) >= 4 else last_close
+        bounced_up  = recent_low < last_close * 0.997
+        near_pivot  = extension < 0.6
 
         if bounced_up and near_pivot:
             entry_price = pivot * 0.999
@@ -488,12 +590,13 @@ def generate_signal_row(symbol: str, interval: str, sentiment: SentimentResult) 
         if side in {"LONG", "SHORT"}:
             entry_timing, entry_offset, timing_mult = _entry_timing(
                 close=close, high=high, low=low,
+                open_=open_, vol=vol,
                 atr=atr_val, direction=side, lookback=12,
             )
             confidence = min(99.0, confidence * timing_mult)
 
-            # Extended entries are suppressed — treat as HOLD
-            if entry_timing in {"EXTENDED", "NO_BREAKOUT"}:
+            # Fake/extended/no-breakout entries are suppressed — treat as HOLD
+            if entry_timing in {"EXTENDED", "NO_BREAKOUT", "FAKE_BREAKOUT", "REVERSAL"}:
                 row = _hold_row(symbol, sentiment)
                 row.update({
                     "time_window_ok": time_window_ok,
