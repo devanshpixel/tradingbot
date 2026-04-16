@@ -8,7 +8,7 @@ import pandas as pd
 import yfinance as yf
 from zoneinfo import ZoneInfo
 from ta.momentum import RSIIndicator
-from ta.trend import MACD
+from ta.trend import MACD, ADXIndicator
 from ta.volatility import BollingerBands
 
 from news import SentimentResult
@@ -215,6 +215,17 @@ def generate_signal_row(symbol: str, interval: str, sentiment: SentimentResult) 
         bb_high_series = bb.bollinger_hband().dropna()
         bb_low_series = bb.bollinger_lband().dropna()
 
+        # ADX needs at least 28 rows (14-period smoothing twice); fall back to 50 if insufficient
+        _adx_window = 14
+        adx_series = pd.Series(dtype=float)
+        if len(close.dropna()) >= _adx_window * 2:
+            try:
+                adx_obj = ADXIndicator(high=high, low=low, close=close, window=_adx_window)
+                adx_series = adx_obj.adx().dropna()
+            except Exception:
+                pass
+        adx = float(adx_series.iloc[-1]) if not adx_series.empty else 50.0
+
         rsi = float(rsi_series.iloc[-1]) if not rsi_series.empty else 50.0
         rsi_prev = float(rsi_series.iloc[-2]) if len(rsi_series) >= 2 else rsi
         macd_hist = float(macd_hist_series.iloc[-1]) if not macd_hist_series.empty else 0.0
@@ -225,6 +236,20 @@ def generate_signal_row(symbol: str, interval: str, sentiment: SentimentResult) 
         bb_high = float(bb_high_series.iloc[-1]) if not bb_high_series.empty else last_close
         bb_low = float(bb_low_series.iloc[-1]) if not bb_low_series.empty else last_close
         bb_pos = 0.5 if bb_high == bb_low else (last_close - bb_low) / (bb_high - bb_low)
+
+        # Gate: if market is sideways (ADX < 20) skip directional signals entirely
+        _ADX_SIDEWAYS = 20.0
+        _ADX_TRENDING = 25.0
+        if adx < _ADX_SIDEWAYS:
+            row = _hold_row(symbol, sentiment)
+            row.update({
+                "time_window_ok": time_window_ok,
+                "market_bias": "BEARISH" if market_bearish else "BULLISH_OR_NEUTRAL",
+                "adx": round(float(adx), 1),
+                "rsi": round(float(rsi), 1),
+                "regime": "SIDEWAYS",
+            })
+            return row
 
         vol_avg = float(vol.tail(20).mean()) if len(vol) >= 20 else float(vol.mean())
         vol_last = float(vol.iloc[-1]) if len(vol) else 0.0
@@ -339,6 +364,17 @@ def generate_signal_row(symbol: str, interval: str, sentiment: SentimentResult) 
         raw_pts = buy_pts if side == "LONG" else (sell_pts if side == "SHORT" else max(buy_pts, sell_pts))
         confidence = min(99.0, (raw_pts / _MAX_PTS) * 100.0)
 
+        # ADX trend-strength multiplier: strong trend boosts confidence, weak trend penalises
+        if adx >= 35.0:
+            adx_mult = 1.15
+        elif adx >= _ADX_TRENDING:
+            adx_mult = 1.0 + (adx - _ADX_TRENDING) / (_ADX_TRENDING * 2.0)
+        else:
+            # ADX in [_ADX_SIDEWAYS, _ADX_TRENDING) — muted but not blocked
+            adx_mult = 0.80
+        confidence = min(99.0, confidence * adx_mult)
+        regime = "STRONG_TREND" if adx >= 35.0 else ("TRENDING" if adx >= _ADX_TRENDING else "WEAK_TREND")
+
         # Time window and volume adjustments
         volume_confirmed = volume_spike_ok
         if side == "LONG" and market_bearish:
@@ -371,6 +407,8 @@ def generate_signal_row(symbol: str, interval: str, sentiment: SentimentResult) 
             "resistance": round(float(resistance), 2) if resistance is not None else round(float(last_close), 2),
             "market_bias": "BEARISH" if market_bearish else "BULLISH_OR_NEUTRAL",
             "time_window_ok": time_window_ok,
+            "adx": round(float(adx), 1),
+            "regime": regime,
             "volume_confirmed": bool(volume_confirmed),
             "vwap": round(float(vwap), 2),
             "sentiment": sentiment.label,

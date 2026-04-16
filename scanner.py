@@ -161,10 +161,16 @@ def scan_universe(
     # Performance guard: keep scan fast for UI.
     symbols = symbols[:20]
 
+    # Minimum average bar-volume for a symbol to be considered liquid enough.
+    # NSE Nifty-50 5-min bars typically trade hundreds of thousands per bar;
+    # 15 000 is a conservative floor to weed out stale/illiquid symbols.
+    MIN_AVG_VOL = 15_000
+
     rows: list[dict] = []
     for symbol in symbols:
         price = float(cfg.min_price)
         volume = 0.0
+        avg_volume = 0.0
         momentum = 0.0
         try:
             df = _fetch_intraday(symbol=symbol, interval=cfg.interval, period=cfg.period)
@@ -184,49 +190,36 @@ def scan_universe(
                 vol_numeric = pd.to_numeric(vol_like, errors="coerce").fillna(0.0)
                 if not vol_numeric.empty:
                     volume = float(vol_numeric.iloc[-1])
+                    avg_volume = float(vol_numeric.mean())
         except Exception as exc:
             print(f"[scanner] safe_default symbol={symbol} error={exc}")
 
-        # Always append a usable numeric row for each symbol.
+        # Skip low-volume / illiquid symbols entirely.
+        if avg_volume < MIN_AVG_VOL:
+            print(f"[scanner] low_volume_skip symbol={symbol} avg_vol={avg_volume:.0f}")
+            continue
+
         rows.append(
             {
                 "symbol": str(symbol),
                 "price": round(float(price), 2),
                 "volume": round(float(max(0.0, volume)), 2),
+                "avg_volume": round(float(avg_volume), 0),
                 "momentum": round(float(momentum), 2),
-                # Backward-compatible aliases used elsewhere in UI.
                 "last": round(float(price), 2),
                 "vol_last": round(float(max(0.0, volume)), 2),
                 "momentum_%": round(float(momentum), 2),
             }
         )
 
-    # Prefer symbols with stronger activity, but always return at least 10 rows.
-    ranked = sorted(rows, key=lambda r: (float(r["volume"]), abs(float(r["momentum"]))), reverse=True)
+    # Rank by average volume then momentum; always return at least 10 rows.
+    ranked = sorted(rows, key=lambda r: (float(r["avg_volume"]), abs(float(r["momentum"]))), reverse=True)
     if len(ranked) >= 10:
         selected = ranked[: max(10, min(20, len(ranked)))]
     else:
-        # If universe is very small, recycle defaults from NSE universe to ensure 10.
-        needed = 10 - len(ranked)
-        for sym in default_nse_universe():
-            if needed <= 0:
-                break
-            if any(r["symbol"] == sym for r in ranked):
-                continue
-            ranked.append(
-                {
-                    "symbol": sym,
-                    "price": round(float(cfg.min_price), 2),
-                    "volume": 0.0,
-                    "momentum": 0.0,
-                    "last": round(float(cfg.min_price), 2),
-                    "vol_last": 0.0,
-                    "momentum_%": 0.0,
-                }
-            )
-            needed -= 1
-        selected = ranked[:10]
+        selected = ranked  # return whatever passed the volume filter
 
-    # Guaranteed non-empty DataFrame with stable columns.
-    return pd.DataFrame(selected, columns=["symbol", "price", "volume", "momentum", "last", "vol_last", "momentum_%"])
+    if not selected:
+        return pd.DataFrame(columns=["symbol", "price", "volume", "avg_volume", "momentum", "last", "vol_last", "momentum_%"])
+    return pd.DataFrame(selected, columns=["symbol", "price", "volume", "avg_volume", "momentum", "last", "vol_last", "momentum_%"])
 

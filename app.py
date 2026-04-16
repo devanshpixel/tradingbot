@@ -116,13 +116,8 @@ if not signals_df.empty:
     # Sort all rows by confidence descending
     signals_df = signals_df.sort_values(["confidence", "score_total"], ascending=[False, False])
 
-    # Prefer BUY/SELL rows; pad with highest-confidence HOLDs only if needed to reach 3
-    directional = signals_df[signals_df["signal"].isin(["BUY", "SELL"])].head(5)
-    if len(directional) < 3:
-        hold_rows = signals_df[signals_df["signal"] == "HOLD"].head(3 - len(directional))
-        directional = pd.concat([directional, hold_rows])
-
-    actionable = directional.sort_values(["confidence", "score_total"], ascending=[False, False]).head(5).copy()
+    # Show only the top 3 genuine BUY/SELL signals — no HOLDs, no fallback overrides
+    actionable = signals_df[signals_df["signal"].isin(["BUY", "SELL"])].head(3).copy()
 
     # Fill missing trade levels from scanner price
     if not actionable.empty:
