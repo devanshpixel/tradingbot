@@ -156,6 +156,99 @@ def _hold_row(symbol: str, sentiment: SentimentResult) -> dict[str, Any]:
     }
 
 
+def _atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> float:
+    """True Range average over `window` bars."""
+    h = pd.to_numeric(high, errors="coerce")
+    l = pd.to_numeric(low, errors="coerce")
+    c = pd.to_numeric(close, errors="coerce")
+    prev_c = c.shift(1)
+    tr = pd.concat([(h - l), (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
+    atr_val = float(tr.dropna().tail(window).mean())
+    return atr_val if atr_val > 0 else float(c.dropna().iloc[-1]) * 0.005
+
+
+def _entry_timing(
+    close: pd.Series,
+    high: pd.Series,
+    low: pd.Series,
+    atr: float,
+    direction: str,
+    lookback: int = 12,
+) -> tuple[str, float, float]:
+    """
+    Classify the current bar's entry quality.
+
+    Returns
+    -------
+    timing : str
+        "PULLBACK" | "BREAKOUT" | "CHASING" | "EXTENDED" | "NO_BREAKOUT"
+    entry_offset : float
+        Fraction to add/subtract from last_close to get the ideal entry price.
+        Positive = higher (for longs entering at breakout level + buffer).
+    confidence_mult : float
+        Multiply the raw confidence score by this factor.
+    """
+    c = pd.to_numeric(close, errors="coerce").dropna()
+    h = pd.to_numeric(high, errors="coerce").dropna()
+    l = pd.to_numeric(low, errors="coerce").dropna()
+
+    min_len = lookback + 4
+    if len(c) < min_len or atr <= 0:
+        return "NO_BREAKOUT", 0.0, 0.80
+
+    last_close = float(c.iloc[-1])
+    # Reference window: bars before the most recent 2 bars (avoid including the signal bar)
+    ref_high = float(h.iloc[-(lookback + 2): -2].max())
+    ref_low  = float(l.iloc[-(lookback + 2): -2].min())
+
+    if direction == "LONG":
+        pivot = ref_high
+        if last_close <= pivot:
+            return "NO_BREAKOUT", 0.0, 0.65
+
+        extension = (last_close - pivot) / atr
+
+        # Detect pullback: price broke out then retraced back near the pivot
+        recent_high = float(h.iloc[-4: -1].max()) if len(h) >= 4 else last_close
+        pulled_back = recent_high > last_close * 1.003  # price was higher, now pulled back
+        near_pivot  = extension < 0.6                  # still close to breakout level
+
+        if pulled_back and near_pivot:
+            # Best scenario: entering on a pullback to the breakout level
+            # Entry = just above the pivot
+            entry_price = pivot * 1.001
+            offset = (entry_price - last_close) / last_close
+            return "PULLBACK", offset, 1.20
+
+        if extension <= 1.0:
+            return "BREAKOUT", 0.0, 1.05      # fresh breakout — decent entry
+        if extension <= 2.0:
+            return "CHASING", 0.0, 0.70       # move already underway, risky
+        return "EXTENDED", 0.0, 0.30          # far too late, strong penalty
+
+    else:  # SHORT
+        pivot = ref_low
+        if last_close >= pivot:
+            return "NO_BREAKOUT", 0.0, 0.65
+
+        extension = (pivot - last_close) / atr
+
+        recent_low = float(l.iloc[-4: -1].min()) if len(l) >= 4 else last_close
+        bounced_up = recent_low < last_close * 0.997
+        near_pivot = extension < 0.6
+
+        if bounced_up and near_pivot:
+            entry_price = pivot * 0.999
+            offset = (entry_price - last_close) / last_close
+            return "PULLBACK", offset, 1.20
+
+        if extension <= 1.0:
+            return "BREAKOUT", 0.0, 1.05
+        if extension <= 2.0:
+            return "CHASING", 0.0, 0.70
+        return "EXTENDED", 0.0, 0.30
+
+
 def _levels_from_price(price: float, atr_proxy_pct: float, direction: str) -> tuple[float, float, float]:
     entry = float(price)
     move = max(0.2, float(atr_proxy_pct)) / 100.0 * entry
@@ -250,6 +343,8 @@ def generate_signal_row(symbol: str, interval: str, sentiment: SentimentResult) 
                 "regime": "SIDEWAYS",
             })
             return row
+
+        atr_val = _atr(high=high, low=low, close=close, window=14)
 
         vol_avg = float(vol.tail(20).mean()) if len(vol) >= 20 else float(vol.mean())
         vol_last = float(vol.iloc[-1]) if len(vol) else 0.0
@@ -385,10 +480,54 @@ def generate_signal_row(symbol: str, interval: str, sentiment: SentimentResult) 
         score = raw_pts
         score_total = score + sent_boost * 0.1
 
+        # --- Entry timing quality ---
+        entry_timing = "N/A"
+        extension_atr = 0.0
         entry = stop = target = rr = 0.0
+
         if side in {"LONG", "SHORT"}:
-            entry, stop, target = _levels_from_price(price=last_close, atr_proxy_pct=max(0.6, day_range), direction=side)
+            entry_timing, entry_offset, timing_mult = _entry_timing(
+                close=close, high=high, low=low,
+                atr=atr_val, direction=side, lookback=12,
+            )
+            confidence = min(99.0, confidence * timing_mult)
+
+            # Extended entries are suppressed — treat as HOLD
+            if entry_timing in {"EXTENDED", "NO_BREAKOUT"}:
+                row = _hold_row(symbol, sentiment)
+                row.update({
+                    "time_window_ok": time_window_ok,
+                    "market_bias": "BEARISH" if market_bearish else "BULLISH_OR_NEUTRAL",
+                    "adx": round(float(adx), 1),
+                    "rsi": round(float(rsi), 1),
+                    "regime": regime,
+                    "entry_timing": entry_timing,
+                    "extension_atr": round(extension_atr, 2),
+                    "atr": round(float(atr_val), 2),
+                })
+                return row
+
+            # Adjust entry price: pullback entries use the pivot level, breakouts use last_close
+            adjusted_entry = last_close * (1.0 + entry_offset)
+            entry, stop, target = _levels_from_price(
+                price=adjusted_entry,
+                atr_proxy_pct=max(0.6, float(atr_val / max(1e-9, last_close) * 100.0)),
+                direction=side,
+            )
             rr = _rr(entry=entry, stop=stop, target=target, side=side)
+
+            # Compute extension for output
+            if side == "LONG":
+                c_clean = pd.to_numeric(close, errors="coerce").dropna()
+                h_clean = pd.to_numeric(high, errors="coerce").dropna()
+                if len(h_clean) >= 14:
+                    pivot_h = float(h_clean.iloc[-14:-2].max())
+                    extension_atr = round((last_close - pivot_h) / max(atr_val, 1e-9), 2)
+            else:
+                l_clean = pd.to_numeric(low, errors="coerce").dropna()
+                if len(l_clean) >= 14:
+                    pivot_l = float(l_clean.iloc[-14:-2].min())
+                    extension_atr = round((pivot_l - last_close) / max(atr_val, 1e-9), 2)
 
         return {
             "symbol": symbol,
@@ -409,6 +548,9 @@ def generate_signal_row(symbol: str, interval: str, sentiment: SentimentResult) 
             "time_window_ok": time_window_ok,
             "adx": round(float(adx), 1),
             "regime": regime,
+            "entry_timing": entry_timing,
+            "extension_atr": round(float(extension_atr), 2),
+            "atr": round(float(atr_val), 2),
             "volume_confirmed": bool(volume_confirmed),
             "vwap": round(float(vwap), 2),
             "sentiment": sentiment.label,
