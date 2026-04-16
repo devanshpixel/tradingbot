@@ -99,7 +99,6 @@ for _, s in scan_df.head(20).iterrows():
 
 signals_df = pd.DataFrame(rows)
 if not signals_df.empty:
-    # Some rows may be missing keys depending on upstream failures; avoid KeyError.
     for col, default in (
         ("confidence", 0.0),
         ("score_total", 0.0),
@@ -110,23 +109,22 @@ if not signals_df.empty:
     ):
         if col not in signals_df.columns:
             signals_df[col] = default
-    sort_cols = [c for c in ["confidence", "score_total"] if c in signals_df.columns]
-    if sort_cols:
-        signals_df = signals_df.sort_values(sort_cols, ascending=[False] * len(sort_cols))
 
-    # Keep UI focused on actionable ideas; if none, derive directional picks from score.
-    actionable = signals_df[signals_df["signal"].isin(["BUY", "SELL"])].copy()
-    # Filter weak signals first.
-    actionable = actionable[pd.to_numeric(actionable["confidence"], errors="coerce").fillna(0.0) >= 55.0]
-    if actionable.empty:
-        signals_df["signal"] = signals_df["score_total"].apply(lambda x: "BUY" if float(x) >= 0 else "SELL")
-        actionable = signals_df.head(10).copy()
-    # Always keep at least 3 actionable rows.
-    if len(actionable) < 3:
-        fallback = signals_df.copy()
-        if "score_total" in fallback.columns:
-            fallback["signal"] = fallback["score_total"].apply(lambda x: "BUY" if float(x) >= 0 else "SELL")
-        actionable = fallback.sort_values(["confidence", "score_total"], ascending=[False, False]).head(3)
+    signals_df["confidence"] = pd.to_numeric(signals_df["confidence"], errors="coerce").fillna(0.0)
+    signals_df["score_total"] = pd.to_numeric(signals_df["score_total"], errors="coerce").fillna(0.0)
+
+    # Sort all rows by confidence descending
+    signals_df = signals_df.sort_values(["confidence", "score_total"], ascending=[False, False])
+
+    # Prefer BUY/SELL rows; pad with highest-confidence HOLDs only if needed to reach 3
+    directional = signals_df[signals_df["signal"].isin(["BUY", "SELL"])].head(5)
+    if len(directional) < 3:
+        hold_rows = signals_df[signals_df["signal"] == "HOLD"].head(3 - len(directional))
+        directional = pd.concat([directional, hold_rows])
+
+    actionable = directional.sort_values(["confidence", "score_total"], ascending=[False, False]).head(5).copy()
+
+    # Fill missing trade levels from scanner price
     if not actionable.empty:
         price_map = {}
         if not scan_df.empty and "symbol" in scan_df.columns:
@@ -135,7 +133,6 @@ if not signals_df.empty:
                 price_map = dict(zip(scan_df["symbol"].astype(str), pd.to_numeric(scan_df[price_col], errors="coerce").fillna(0.0)))
         for col in ["entry", "stop_loss", "target"]:
             actionable[col] = pd.to_numeric(actionable[col], errors="coerce").fillna(0.0)
-        # Fill missing trade levels from scanner price so orders remain valid.
         actionable["entry"] = actionable.apply(
             lambda r: float(r["entry"]) if float(r["entry"]) > 0 else float(price_map.get(str(r["symbol"]), 0.0)), axis=1
         )
@@ -145,7 +142,8 @@ if not signals_df.empty:
         actionable["target"] = actionable.apply(
             lambda r: float(r["target"]) if float(r["target"]) > 0 else float(r["entry"]) * 1.01, axis=1
         )
-    signals_df = actionable.sort_values(["confidence", "score_total"], ascending=[False, False]).head(5).reset_index(drop=True)
+
+    signals_df = actionable.reset_index(drop=True)
 st.dataframe(signals_df, use_container_width=True, hide_index=True)
 
 st.subheader("Paper trading")

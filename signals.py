@@ -245,37 +245,109 @@ def generate_signal_row(symbol: str, interval: str, sentiment: SentimentResult) 
         rsi_falling = rsi < rsi_prev
         macd_cross_up = macd_line_prev <= macd_signal_prev and macd_line > macd_signal
         macd_cross_down = macd_line_prev >= macd_signal_prev and macd_line < macd_signal
-        volume_spike_ok = vol_spike > 1.5
+        volume_spike_ok = vol_spike > 1.3
         price_above_vwap = last_close > vwap
         price_below_vwap = last_close < vwap
 
-        buy_setup = (40.0 <= rsi <= 60.0) and rsi_rising and macd_cross_up and volume_spike_ok and price_above_vwap
-        sell_setup = (((rsi > 60.0) and rsi_falling) or ((rsi < 40.0) and rsi_falling)) and macd_cross_down and volume_spike_ok and price_below_vwap
+        # --- Point-based scoring for both directions ---
+        buy_pts = 0.0
+        sell_pts = 0.0
 
-        side = "LONG" if buy_setup else ("SHORT" if sell_setup else "FLAT")
+        # RSI
+        if rsi < 35:
+            buy_pts += 18.0
+        elif rsi < 45 and rsi_rising:
+            buy_pts += 12.0
+        elif rsi < 55 and rsi_rising:
+            buy_pts += 7.0
+        if rsi > 65:
+            sell_pts += 18.0
+        elif rsi > 55 and rsi_falling:
+            sell_pts += 12.0
+        elif rsi > 45 and rsi_falling:
+            sell_pts += 7.0
+
+        # MACD
+        if macd_cross_up:
+            buy_pts += 16.0
+        elif macd_hist > 0:
+            buy_pts += 8.0
+        if macd_cross_down:
+            sell_pts += 16.0
+        elif macd_hist < 0:
+            sell_pts += 8.0
+
+        # MACD histogram magnitude (trend strength)
+        hist_boost = min(10.0, abs(macd_hist) * 200.0)
+        if macd_hist > 0:
+            buy_pts += hist_boost
+        elif macd_hist < 0:
+            sell_pts += hist_boost
+
+        # VWAP
+        if price_above_vwap:
+            buy_pts += 10.0
+        if price_below_vwap:
+            sell_pts += 10.0
+
+        # Bollinger Bands position
+        if bb_pos < 0.2:
+            buy_pts += 8.0
+        elif bb_pos > 0.8:
+            sell_pts += 8.0
+
+        # Volume
+        vol_bonus = min(15.0, max(0.0, (vol_spike - 1.0) * 12.0))
+        buy_pts += vol_bonus if volume_spike_ok else 0.0
+        sell_pts += vol_bonus if volume_spike_ok else 0.0
+
+        # Candlestick pattern
+        bull_patterns = {"HAMMER", "BULL_ENGULFING", "MORNING_STAR"}
+        bear_patterns = {"BEAR_ENGULFING"}
+        if pattern_name in bull_patterns:
+            buy_pts += abs(pattern_score)
+        elif pattern_name in bear_patterns:
+            sell_pts += abs(pattern_score)
+        # DOJI is direction-neutral — slight boost to whichever is leading
+        elif pattern_name == "DOJI":
+            buy_pts += 1.5
+            sell_pts += 1.5
+
+        # Sentiment
+        sent_boost = float(sentiment.confidence_boost)
+        if sent_boost > 0:
+            buy_pts += min(8.0, sent_boost * 0.15)
+        elif sent_boost < 0:
+            sell_pts += min(8.0, abs(sent_boost) * 0.15)
+
+        # Market bias penalty
+        if market_bearish:
+            buy_pts *= 0.75
+
+        # Determine direction
+        _SIGNAL_THRESHOLD = 20.0
+        if buy_pts >= _SIGNAL_THRESHOLD and buy_pts > sell_pts:
+            side = "LONG"
+        elif sell_pts >= _SIGNAL_THRESHOLD and sell_pts > buy_pts:
+            side = "SHORT"
+        else:
+            side = "FLAT"
         signal = "BUY" if side == "LONG" else ("SELL" if side == "SHORT" else "HOLD")
 
-        # Confidence = indicator alignment + volume strength + trend strength
-        alignment_count = sum(
-            [
-                bool((40.0 <= rsi <= 60.0) and rsi_rising) if side == "LONG" else bool((((rsi > 60.0) and rsi_falling) or ((rsi < 40.0) and rsi_falling))),
-                bool(macd_cross_up) if side == "LONG" else bool(macd_cross_down),
-                bool(price_above_vwap) if side == "LONG" else bool(price_below_vwap),
-            ]
-        ) if side in {"LONG", "SHORT"} else 0
-        indicator_alignment = (alignment_count / 3.0) * 60.0
-        volume_strength = min(25.0, max(0.0, (vol_spike - 1.0) * 25.0))
-        trend_strength = min(15.0, abs(macd_hist) * 300.0)
-        confidence = indicator_alignment + volume_strength + trend_strength
-        score = (indicator_alignment * 0.5) + (volume_strength * 0.3) + (trend_strength * 0.2)
-        score_total = score + float(sentiment.confidence_boost) * 0.2
+        # Confidence: scale the winning side's score to 0–100
+        _MAX_PTS = 85.0
+        raw_pts = buy_pts if side == "LONG" else (sell_pts if side == "SHORT" else max(buy_pts, sell_pts))
+        confidence = min(99.0, (raw_pts / _MAX_PTS) * 100.0)
 
+        # Time window and volume adjustments
         volume_confirmed = volume_spike_ok
-
         if side == "LONG" and market_bearish:
-            confidence *= 0.6
+            confidence *= 0.85
         if side in {"LONG", "SHORT"} and not time_window_ok:
-            confidence *= 0.8
+            confidence *= 0.90
+
+        score = raw_pts
+        score_total = score + sent_boost * 0.1
 
         entry = stop = target = rr = 0.0
         if side in {"LONG", "SHORT"}:
