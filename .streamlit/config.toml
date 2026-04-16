@@ -6,3 +6,9 @@ secondaryBackgroundColor = "#121A32"
 textColor = "#E5E7EB"
 font = "sans serif"
 
+[server]
+port = 5000
+address = "0.0.0.0"
+headless = true
+enableCORS = false
+enableXsrfProtection = false
